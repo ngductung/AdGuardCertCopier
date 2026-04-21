@@ -129,5 +129,15 @@
 
         </LinearLayout>
 
+        <Space
+            android:layout_width="match_parent"
+            android:layout_height="16dp" />
+
+        <Button
+            android:id="@+id/btnViewLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Xem log" />
+
     </LinearLayout>
 </ScrollView>

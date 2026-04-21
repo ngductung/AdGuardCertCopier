@@ -7,3 +7,4 @@ proguard-rules.pro
 gradlew
 gradlew.bat
 local.properties
+CLAUDE.md
