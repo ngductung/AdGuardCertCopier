@@ -239,16 +239,7 @@ class MainActivity : ComponentActivity() {
     private fun createModuleZip(pemFile: File, hash: String): File {
         val zipFile = File(cacheDir, "adguardcert-module.zip")
         ZipOutputStream(BufferedOutputStream(FileOutputStream(zipFile))).use { zos ->
-            // META-INF - yêu cầu bởi Magisk để nhận diện module zip
-            val metaFiles = listOf(
-                "META-INF/com/google/android/update-binary",
-                "META-INF/com/google/android/updater-script"
-            )
-            for (path in metaFiles) {
-                zos.putNextEntry(ZipEntry(path))
-                zos.write(assets.open(path).readBytes())
-                zos.closeEntry()
-            }
+            
 
             // Module metadata
             val moduleProp = assets.open("module.prop").bufferedReader().use { it.readText() }
