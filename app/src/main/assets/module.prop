@@ -1,0 +1,6 @@
+id=adguardcert
+name=System Cert Installer
+version=v2.1
+versionCode=36
+author=ncvinh
+description=Installs custom CA certificates to system store.

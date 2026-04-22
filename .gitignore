@@ -1,0 +1,10 @@
+.github
+.gradle
+.idea
+.vscode
+**/build/
+**/release/
+gradle
+local.properties
+gradlew
+gradlew.bat
