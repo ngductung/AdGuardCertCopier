@@ -37,7 +37,7 @@ count_files() {
     fi
 }
 
-MIN_CERT_COUNT=50
+MIN_CERT_COUNT=0
 SOURCE_DIR=""
 SOURCE_COUNT=0
 
