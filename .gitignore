@@ -8,3 +8,11 @@ gradle
 local.properties
 gradlew
 gradlew.bat
+
+# AI agent / tooling
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.codegraph/
+.gitnexus/
