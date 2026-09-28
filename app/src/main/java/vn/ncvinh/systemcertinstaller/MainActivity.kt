@@ -27,6 +27,7 @@ import java.security.cert.X509Certificate
 import android.util.Base64
 import android.view.View
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.IOException
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -43,6 +44,10 @@ import kotlinx.coroutines.*
 private class Pkcs12PasswordRequiredException :
     IllegalArgumentException("Định dạng không hỗ trợ hoặc cần mật khẩu PKCS#12.")
 
+/** Không kết nối được tới Burp (timeout, refused, không có route...) -> cho người dùng sửa IP/Port. */
+private class BurpUnreachableException(cause: IOException) :
+    IOException(cause.message ?: cause.javaClass.simpleName, cause)
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var binding: ActivityMainBinding
@@ -56,11 +61,13 @@ class MainActivity : ComponentActivity() {
     private val moduleUpdateDir = "/data/adb/modules_update/adguardcert"
     private val updateDestDir = "$moduleUpdateDir/system/etc/security/cacerts"
     
-    // OkHttp client for downloading certificates
+    // OkHttp client for downloading certificates. Burp nằm trong LAN nên timeout ngắn là đủ;
+    // callTimeout giới hạn tổng thời gian để người dùng không phải chờ lâu khi nhập sai IP.
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(15, TimeUnit.SECONDS)
         .build()
 
     private val pickAny = registerForActivityResult(
@@ -167,6 +174,7 @@ class MainActivity : ComponentActivity() {
         sourceName: String,
         pkcs12Password: String?,
         onNeedPassword: (() -> Unit)?,
+        onUnreachable: ((BurpUnreachableException) -> Unit)? = null,
         readBytes: suspend () -> ByteArray
     ) {
         setButtonsEnabled(false)
@@ -206,6 +214,10 @@ class MainActivity : ComponentActivity() {
             } catch (e: Pkcs12PasswordRequiredException) {
                 setButtonsEnabled(true)
                 if (onNeedPassword != null) onNeedPassword() else setStatus("Lỗi: ${e.message}")
+            } catch (e: BurpUnreachableException) {
+                setButtonsEnabled(true)
+                if (onUnreachable != null) onUnreachable(e)
+                else setStatus("Lỗi khi xử lý chứng chỉ từ $sourceName: ${e.message}")
             } catch (e: Exception) {
                 setStatus("Lỗi khi xử lý chứng chỉ từ $sourceName: ${e.message ?: e.toString()}")
                 setButtonsEnabled(true)
@@ -598,22 +610,27 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    private fun showBurpSuiteDownloadDialog() {
+    /** Khi mở lại do nhập sai / không kết nối được thì truyền giá trị vừa nhập để người dùng sửa tiếp. */
+    private fun showBurpSuiteDownloadDialog(
+        initialIp: String = "192.168.4.113",
+        initialPort: String = "8080"
+    ) {
         val container = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(50, 20, 50, 20)
         }
-        
+
         val ipInput = EditText(this).apply {
             hint = "IP Address (ví dụ: 192.168.4.113)"
             inputType = InputType.TYPE_CLASS_TEXT
-            setText("192.168.4.113")
+            setText(initialIp)
+            setSelection(initialIp.length)
         }
-        
+
         val portInput = EditText(this).apply {
             hint = "Port (ví dụ: 8080)"
             inputType = InputType.TYPE_CLASS_NUMBER
-            setText("8080")
+            setText(initialPort)
         }
         
         container.addView(android.widget.TextView(this).apply {
@@ -635,14 +652,25 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Tải") { _, _ ->
                 val ip = ipInput.text?.toString()?.trim() ?: ""
                 val port = portInput.text?.toString()?.trim() ?: ""
-                if (ip.isNotEmpty() && port.isNotEmpty()) {
+                val error = validateBurpAddress(ip, port)
+                if (error == null) {
                     downloadCertificateFromBurpSuite(ip, port)
                 } else {
-                    Toast.makeText(this, "Vui lòng nhập đầy đủ IP và Port", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
+                    showBurpSuiteDownloadDialog(ip, port)
                 }
             }
             .setNegativeButton("Hủy", null)
             .show()
+    }
+
+    /** Trả về thông báo lỗi, hoặc null nếu IP/Port hợp lệ. */
+    private fun validateBurpAddress(ip: String, port: String): String? {
+        if (ip.isEmpty() || port.isEmpty()) return "Vui lòng nhập đầy đủ IP và Port"
+        val portNum = port.toIntOrNull()
+        if (portNum == null || portNum !in 1..65535) return "Port không hợp lệ (1-65535)"
+        if ("http://$ip:$port/cert".toHttpUrlOrNull() == null) return "IP/hostname không hợp lệ: $ip"
+        return null
     }
 
     private fun downloadCertificateFromBurpSuite(ip: String, port: String) {
@@ -653,10 +681,31 @@ class MainActivity : ComponentActivity() {
         installNewCert(
             sourceName = "Burp Suite ($ip:$port)",
             pkcs12Password = null,
-            onNeedPassword = null
+            onNeedPassword = null,
+            onUnreachable = { e -> showBurpUnreachableDialog(ip, port, e) }
         ) {
             downloadBurpSuiteCertificate(certUrl)
         }
+    }
+
+    private fun showBurpUnreachableDialog(ip: String, port: String, e: BurpUnreachableException) {
+        val reason = when (e.cause) {
+            is java.net.UnknownHostException -> "Không phân giải được địa chỉ \"$ip\"."
+            is java.net.NoRouteToHostException -> "Không có đường tới $ip (điện thoại và máy chạy Burp có cùng mạng không?)."
+            is java.net.ConnectException -> "Kết nối bị từ chối: $ip đang không mở port $port (sai Port, hoặc listener của Burp chưa bind vào IP này / All interfaces)."
+            is java.io.InterruptedIOException -> "Hết thời gian chờ: không có phản hồi từ $ip:$port (sai IP, máy tắt, firewall chặn hoặc Wi-Fi bật AP isolation)."
+            else -> e.message ?: "Lỗi mạng không xác định."
+        }
+        setStatus("❌ Không kết nối được tới Burp Suite ($ip:$port)")
+        logActivity("Burp không truy cập được: ${e.cause?.javaClass?.simpleName}: ${e.message}")
+
+        AlertDialog.Builder(this)
+            .setTitle("Không kết nối được tới $ip:$port")
+            .setMessage(reason)
+            .setPositiveButton("Sửa IP") { _, _ -> showBurpSuiteDownloadDialog(ip, port) }
+            .setNeutralButton("Thử lại") { _, _ -> downloadCertificateFromBurpSuite(ip, port) }
+            .setNegativeButton("Đóng", null)
+            .show()
     }
 
     private suspend fun downloadBurpSuiteCertificate(certUrl: String): ByteArray = withContext(Dispatchers.IO) {
@@ -664,15 +713,20 @@ class MainActivity : ComponentActivity() {
             .url(certUrl)
             .build()
 
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("Không thể tải chứng chỉ từ Burp Suite. Kiểm tra:\n" +
-                        "1. Burp Suite đang chạy\n" +
-                        "2. IP và Port đúng\n" +
-                        "3. Proxy listener đã bật\n" +
-                        "Mã lỗi: ${response.code}")
+        try {
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IllegalStateException("Không thể tải chứng chỉ từ Burp Suite. Kiểm tra:\n" +
+                            "1. Burp Suite đang chạy\n" +
+                            "2. IP và Port đúng\n" +
+                            "3. Proxy listener đã bật\n" +
+                            "Mã lỗi: ${response.code}")
+                }
+                response.body?.bytes() ?: throw IllegalStateException("Phản hồi rỗng từ Burp Suite")
             }
-            response.body?.bytes() ?: throw IOException("Phản hồi rỗng từ Burp Suite")
+        } catch (e: IOException) {
+            // Mọi lỗi IO ở đây là lỗi mạng (lỗi HTTP/response rỗng ở trên dùng IllegalStateException)
+            throw BurpUnreachableException(e)
         }
     }
 
@@ -713,7 +767,89 @@ class MainActivity : ComponentActivity() {
         return md.digest().joinToString("") { "%02x".format(it) }.substring(0, 10)
     }
 
-    private fun promptSaveCert(pemFile: File, onDone: () -> Unit = {}) {
+    /** SHA-256 của cert (DER) để so trùng nội dung, không phụ thuộc cách xuống dòng của file PEM. */
+    private fun certSha256(file: File): String? = try {
+        MessageDigest.getInstance("SHA-256").digest(x509FromPemFile(file).encoded)
+            .joinToString("") { "%02x".format(it) }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun findSavedDuplicate(sha256: String): File? =
+        savedDir().listFiles()
+            ?.filter { it.isFile && it.name.endsWith(".pem") }
+            ?.sortedBy { it.name }
+            ?.firstOrNull { certSha256(it) == sha256 }
+
+    /**
+     * Kiểm tra trước khi lưu: (1) cert đã được lưu dưới tên khác -> hỏi có lưu thêm không;
+     * (2) tên đã tồn tại với cert khác -> hỏi ghi đè / đặt tên khác. onDone được gọi đúng một lần.
+     */
+    private fun saveCertWithChecks(pemFile: File, rawName: String, onDone: () -> Unit, skipDuplicateCheck: Boolean = false) {
+        val name = sanitizeName(rawName)
+        val target = File(savedDir(), "$name.pem")
+        val sha256 = certSha256(pemFile)
+
+        if (!skipDuplicateCheck && sha256 != null) {
+            val dup = findSavedDuplicate(sha256)
+            if (dup != null) {
+                val dupName = dup.nameWithoutExtension
+                if (dup.name == target.name) {
+                    Toast.makeText(this, "Chứng chỉ này đã được lưu với tên \"$dupName\".", Toast.LENGTH_SHORT).show()
+                    logActivity("Bỏ qua lưu: chứng chỉ đã có với tên \"$dupName\"")
+                    onDone()
+                    return
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Chứng chỉ đã được lưu")
+                    .setMessage("Chứng chỉ này đã được lưu với tên \"$dupName\".\n\nBạn vẫn muốn lưu thêm với tên \"$name\"?")
+                    .setPositiveButton("Vẫn lưu") { _, _ ->
+                        saveCertWithChecks(pemFile, rawName, onDone, skipDuplicateCheck = true)
+                    }
+                    .setNegativeButton("Bỏ qua") { _, _ ->
+                        logActivity("Người dùng bỏ qua lưu vì trùng với \"$dupName\"")
+                        onDone()
+                    }
+                    .setCancelable(false)
+                    .show()
+                return
+            }
+        }
+
+        if (target.exists()) {
+            AlertDialog.Builder(this)
+                .setTitle("Tên đã tồn tại")
+                .setMessage("Đã có chứng chỉ khác tên \"$name\".\n\nGhi đè sẽ xoá chứng chỉ cũ đã lưu với tên này.")
+                .setPositiveButton("Ghi đè") { _, _ ->
+                    logActivity("Ghi đè chứng chỉ đã lưu \"$name\"")
+                    writeSavedCert(pemFile, target, onDone)
+                }
+                .setNeutralButton("Đặt tên khác") { _, _ ->
+                    promptSaveCert(pemFile, rawName, onDone)
+                }
+                .setNegativeButton("Huỷ") { _, _ -> onDone() }
+                .setCancelable(false)
+                .show()
+            return
+        }
+
+        writeSavedCert(pemFile, target, onDone)
+    }
+
+    private fun writeSavedCert(pemFile: File, target: File, onDone: () -> Unit) {
+        try {
+            target.parentFile?.mkdirs()
+            pemFile.copyTo(target, overwrite = true)
+            Toast.makeText(this, "Đã lưu: ${target.name}", Toast.LENGTH_SHORT).show()
+            logActivity("Đã lưu chứng chỉ: ${target.name}")
+        } catch (e: Exception) {
+            Toast.makeText(this, "Không lưu được: ${e.message}", Toast.LENGTH_LONG).show()
+        } finally {
+            onDone()
+        }
+    }
+
+    private fun promptSaveCert(pemFile: File, initialName: String = "", onDone: () -> Unit = {}) {
         val sidePadding = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
             24f,
@@ -731,6 +867,8 @@ class MainActivity : ComponentActivity() {
 
         val input = EditText(this).apply {
             hint = "Tên chứng chỉ (ví dụ: Burp CA)"
+            setText(initialName)
+            setSelection(initialName.length)
             layoutParams = android.widget.FrameLayout.LayoutParams(
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                 android.widget.FrameLayout.LayoutParams.WRAP_CONTENT
@@ -742,19 +880,7 @@ class MainActivity : ComponentActivity() {
             .setTitle("Lưu chứng chỉ vừa cài?")
             .setView(container)
             .setPositiveButton("Lưu") { _, _ ->
-                val raw = input.text?.toString() ?: ""
-                val name = sanitizeName(raw)
-                try {
-                    val dir = savedDir()
-                    val target = File(dir, "$name.pem")
-                    if (!dir.exists()) dir.mkdirs()
-                    pemFile.copyTo(target, overwrite = true)
-                    Toast.makeText(this, "Đã lưu: ${target.name}", Toast.LENGTH_SHORT).show()
-                } catch (e: Exception) {
-                    Toast.makeText(this, "Không lưu được: ${e.message}", Toast.LENGTH_LONG).show()
-                } finally {
-                    onDone()
-                }
+                saveCertWithChecks(pemFile, input.text?.toString() ?: "", onDone)
             }
             .setNegativeButton("Không") { _, _ -> onDone() }
             .setCancelable(false)
@@ -1183,8 +1309,9 @@ class MainActivity : ComponentActivity() {
             logBuffer.delete(0, logBuffer.length - maxLogChars)
         }
         binding.tvLog.text = logBuffer.toString()
+        // Không dùng fullScroll(): nó chuyển focus sang tvLog, khiến NestedScrollView ngoài cuộn xuống cuối màn hình
         binding.logScroll.post {
-            binding.logScroll.fullScroll(View.FOCUS_DOWN)
+            binding.logScroll.scrollTo(0, binding.tvLog.bottom)
         }
     }
 
