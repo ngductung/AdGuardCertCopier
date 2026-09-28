@@ -9,12 +9,14 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.text.InputType
 import android.util.TypedValue
 import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
 import vn.ncvinh.systemcertinstaller.databinding.ActivityMainBinding
 import com.topjohnwu.superuser.Shell
 import java.io.ByteArrayInputStream
@@ -34,7 +36,12 @@ import java.util.Date
 import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlin.coroutines.resume
 import kotlinx.coroutines.*
+
+/** File không phải PEM/DER và chưa có mật khẩu -> cần hỏi mật khẩu PKCS#12. */
+private class Pkcs12PasswordRequiredException :
+    IllegalArgumentException("Định dạng không hỗ trợ hoặc cần mật khẩu PKCS#12.")
 
 class MainActivity : ComponentActivity() {
 
@@ -111,8 +118,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun looksLikePkcs12(uri: Uri): Boolean {
-        val name = uri.lastPathSegment?.lowercase() ?: return false
+        // lastPathSegment của content URI thường không có tên file (vd "msf:1234"), nên ưu tiên DISPLAY_NAME
+        val name = (queryDisplayName(uri) ?: uri.lastPathSegment)?.lowercase() ?: return false
         return name.endsWith(".p12") || name.endsWith(".pfx")
+    }
+
+    private fun queryDisplayName(uri: Uri): String? = try {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+    } catch (_: Exception) {
+        null
     }
 
     private fun askPasswordAndProcess(uri: Uri) {
@@ -133,36 +149,91 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processAndCopy(uri: Uri, pkcs12Password: String?) {
-        try {
-            setButtonsEnabled(false)
-            logActivity("Bắt đầu xử lý chứng chỉ đầu vào")
-
-            if (!ensureRootAccess()) {
-                setButtonsEnabled(true)
-                return
-            }
-
-            val pemFile = ensurePemFromUri(uri, pkcs12Password)
-            val cert = x509FromPemFile(pemFile)
-            val hash = getSubjectHash(cert)
-            logActivity("Đã chuyển đổi sang PEM và tính subject hash: $hash")
-
-            if (!installCertificateAsKernelSuModule(pemFile, hash)) {
-                setButtonsEnabled(true)
-                return
-            }
-
-            setStatus("Cài module thành công! Đang tiến hành hot inject...")
-            promptSaveCert(pemFile) {
-                // Đổi luồng: Gọi Inject thay vì Countdown
-                applyCertWithoutReboot(pemFile, hash)
-            }
-        } catch (e: Exception) {
-            setStatus("Lỗi: ${e.message ?: e.toString()}")
-            logActivity("Lỗi xử lý chứng chỉ: ${e.message ?: e.toString()}")
-            setButtonsEnabled(true)
+        installNewCert(
+            sourceName = queryDisplayName(uri) ?: uri.lastPathSegment ?: "file",
+            pkcs12Password = pkcs12Password,
+            onNeedPassword = { askPasswordAndProcess(uri) }
+        ) {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("Không đọc được dữ liệu từ file đã chọn.")
         }
     }
+
+    /**
+     * Luồng chung cho cert mới (file hoặc Burp): đọc + chuyển PEM, người dùng xác nhận fingerprint,
+     * cài module, rồi hot inject. Mọi thao tác IO/root chạy trên Dispatchers.IO để tránh ANR.
+     */
+    private fun installNewCert(
+        sourceName: String,
+        pkcs12Password: String?,
+        onNeedPassword: (() -> Unit)?,
+        readBytes: suspend () -> ByteArray
+    ) {
+        setButtonsEnabled(false)
+        logActivity("Bắt đầu xử lý chứng chỉ từ $sourceName")
+
+        lifecycleScope.launch {
+            try {
+                val (pemFile, cert) = withContext(Dispatchers.IO) {
+                    val pem = ensurePemFromBytes(readBytes(), pkcs12Password)
+                    pem to x509FromPemFile(pem)
+                }
+
+                if (!confirmCertificate(cert, sourceName)) {
+                    setStatus("Đã huỷ cài đặt chứng chỉ.")
+                    cleanupAppTempFiles()
+                    setButtonsEnabled(true)
+                    return@launch
+                }
+
+                val hash = getSubjectHash(cert)
+                logActivity("Đã chuyển đổi sang PEM và tính subject hash: $hash")
+
+                val installed = withContext(Dispatchers.IO) {
+                    ensureRootAccess() && installCertificateAsKernelSuModule(pemFile, hash)
+                }
+                if (!installed) {
+                    setButtonsEnabled(true)
+                    return@launch
+                }
+
+                setStatus("Cài module thành công! Đang tiến hành hot inject...")
+                promptSaveCert(pemFile) {
+                    applyCertWithoutReboot(pemFile, hash)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Pkcs12PasswordRequiredException) {
+                setButtonsEnabled(true)
+                if (onNeedPassword != null) onNeedPassword() else setStatus("Lỗi: ${e.message}")
+            } catch (e: Exception) {
+                setStatus("Lỗi khi xử lý chứng chỉ từ $sourceName: ${e.message ?: e.toString()}")
+                setButtonsEnabled(true)
+            }
+        }
+    }
+
+    /** Hiện subject + SHA-256 để người dùng kiểm tra đúng cert trước khi đưa vào system store. */
+    private suspend fun confirmCertificate(cert: X509Certificate, sourceName: String): Boolean =
+        suspendCancellableCoroutine { cont ->
+            val sha256 = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
+                .joinToString(":") { "%02X".format(it) }
+            val message = "Nguồn: $sourceName\n\n" +
+                "Subject:\n${cert.subjectX500Principal.name}\n\n" +
+                "Issuer:\n${cert.issuerX500Principal.name}\n\n" +
+                "Hết hạn: ${SimpleDateFormat("dd/MM/yyyy", Locale.getDefault()).format(cert.notAfter)}\n\n" +
+                "SHA-256:\n$sha256"
+            logActivity("Chứng chỉ chờ xác nhận: ${cert.subjectX500Principal.name} | SHA-256 $sha256")
+
+            val dialog = AlertDialog.Builder(this)
+                .setTitle("Xác nhận cài chứng chỉ CA")
+                .setMessage(message)
+                .setPositiveButton("Cài đặt") { _, _ -> if (cont.isActive) cont.resume(true) }
+                .setNegativeButton("Huỷ") { _, _ -> if (cont.isActive) cont.resume(false) }
+                .setOnCancelListener { if (cont.isActive) cont.resume(false) }
+                .show()
+            cont.invokeOnCancellation { dialog.dismiss() }
+        }
 
     private fun createModuleFiles(): Boolean {
         val modulePropContent = assets.open("module.prop").bufferedReader().use { it.readText() }
@@ -337,7 +408,7 @@ class MainActivity : ComponentActivity() {
         binding.tvCountdown.text = "⏳ Đang xử lý tiêm..."
         setButtonsEnabled(false)
 
-        CoroutineScope(Dispatchers.IO).launch {
+        lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val scriptPath = "/data/local/tmp/inject_cert.sh"
                 val tempHotInjectDir = "/data/local/tmp/hot_inject_certs"
@@ -387,7 +458,7 @@ class MainActivity : ComponentActivity() {
                 // 4. Dọn dẹp
                 runShellWithLog("Dọn dẹp Hot-Inject", "rm -f \"$scriptPath\"", "rm -rf \"$tempHotInjectDir\"")
 
-                runOnUiThread {
+                withContext(Dispatchers.Main) {
                     cleanupAppTempFiles()
                     if (result.isSuccess) {
                         setStatus("✅ Hot inject hoàn tất! Hệ thống đã nhận chứng chỉ.")
@@ -419,8 +490,10 @@ class MainActivity : ComponentActivity() {
                     }
                     setButtonsEnabled(true)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                runOnUiThread {
+                withContext(Dispatchers.Main) {
                     cleanupAppTempFiles()
                     setStatus("❌ Lỗi: ${e.message}")
                     binding.tvCountdown.text = "❌ Lỗi thực thi"
@@ -431,24 +504,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    private fun captureStartupDiagnostics() {
-        runShellWithLog(
-            "Startup diagnostics",
-            "id",
-            "id -u",
-            "uname -a 2>&1 || true",
-            "getprop ro.product.manufacturer 2>&1 || true",
-            "getprop ro.product.model 2>&1 || true",
-            "getprop ro.build.fingerprint 2>&1 || true",
-            "getprop ro.boot.vbmeta.device_state 2>&1 || true",
-            "getenforce 2>&1 || true",
-            "command -v ksud 2>&1 || true",
-            "ls -l /data/adb 2>&1 || true",
-            "ls -l /data/adb/modules 2>&1 || true",
-            "mount | grep -E 'apex|conscrypt|cacerts' 2>&1 || true"
-        )
     }
 
     private fun captureHotInjectDiagnostics(stage: String, hash: String, tempHotInjectDir: String) {
@@ -485,17 +540,22 @@ class MainActivity : ComponentActivity() {
             override fun onFinish() {
                 binding.tvCountdown.text = "Đang khởi động lại..."
                 logActivity("Đang gửi lệnh reboot")
-                val res = runShellWithLog(
-                    "Reboot tự động",
-                    "svc power reboot || reboot || setprop sys.powerctl reboot"
-                )
-                if (!res.isSuccess) {
+                rebootDevice("Reboot tự động") {
                     Toast.makeText(this@MainActivity, "Không thể reboot tự động. Vui lòng reboot thủ công.", Toast.LENGTH_LONG).show()
                     logActivity("Reboot tự động thất bại")
                     setButtonsEnabled(true)
                 }
             }
         }.start()
+    }
+
+    private fun rebootDevice(step: String, onFailure: () -> Unit) {
+        lifecycleScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runShellWithLog(step, "svc power reboot || reboot || setprop sys.powerctl reboot")
+            }
+            if (!res.isSuccess) onFailure()
+        }
     }
 
     private fun setButtonsEnabled(enabled: Boolean) {
@@ -530,11 +590,7 @@ class MainActivity : ComponentActivity() {
             .setTitle("Xác nhận reboot")
             .setMessage("Bạn có chắc chắn muốn khởi động lại thiết bị?")
             .setPositiveButton("Reboot") { _, _ ->
-                val res = runShellWithLog(
-                    "Reboot thủ công",
-                    "svc power reboot || reboot || setprop sys.powerctl reboot"
-                )
-                if (!res.isSuccess) {
+                rebootDevice("Reboot thủ công") {
                     Toast.makeText(this, "Không thể reboot. Vui lòng reboot thủ công.", Toast.LENGTH_LONG).show()
                 }
             }
@@ -590,25 +646,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadCertificateFromBurpSuite(ip: String, port: String) {
-        setButtonsEnabled(false)
+        val certUrl = "http://$ip:$port/cert"
         setStatus("Đang tải chứng chỉ từ Burp Suite ($ip:$port)...")
-        logActivity("Đang tải chứng chỉ từ http://$ip:$port/cert")
+        logActivity("Đang tải chứng chỉ từ $certUrl")
 
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val certUrl = "http://$ip:$port/cert"
-                val certData = downloadBurpSuiteCertificate(certUrl)
-
-                runOnUiThread {
-                    processBurpSuiteCertificateData(certData, ip, port)
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    setStatus("Lỗi khi tải chứng chỉ từ Burp Suite: ${e.message}")
-                    logActivity("Tải Burp Suite thất bại: ${e.message}")
-                    setButtonsEnabled(true)
-                }
-            }
+        installNewCert(
+            sourceName = "Burp Suite ($ip:$port)",
+            pkcs12Password = null,
+            onNeedPassword = null
+        ) {
+            downloadBurpSuiteCertificate(certUrl)
         }
     }
 
@@ -617,44 +664,15 @@ class MainActivity : ComponentActivity() {
             .url(certUrl)
             .build()
 
-        val response = httpClient.newCall(request).execute()
-        if (!response.isSuccessful) {
-            throw IOException("Không thể tải chứng chỉ từ Burp Suite. Kiểm tra:\n" +
-                    "1. Burp Suite đang chạy\n" +
-                    "2. IP và Port đúng\n" +
-                    "3. Proxy listener đã bật\n" +
-                    "Mã lỗi: ${response.code}")
-        }
-        
-        response.body?.bytes() ?: throw IOException("Phản hồi rỗng từ Burp Suite")
-    }
-
-    private fun processBurpSuiteCertificateData(certData: ByteArray, ip: String, port: String) {
-        var tempFile: File? = null
-        try {
-            tempFile = File(cacheDir, "burp_cert.tmp")
-            tempFile.writeBytes(certData)
-            logActivity("Đã nhận dữ liệu chứng chỉ từ Burp Suite, bắt đầu xử lý")
-            processDownloadedCert(tempFile, sourceName = "Burp Suite ($ip:$port)")
-        } catch (e: Exception) {
-            setStatus("Lỗi khi xử lý chứng chỉ từ Burp Suite: ${e.message}")
-            logActivity("Xử lý dữ liệu chứng chỉ Burp Suite thất bại: ${e.message}")
-            setButtonsEnabled(true)
-        } finally {
-            tempFile?.delete()
-        }
-    }
-
-    private fun processDownloadedCert(certFile: File, sourceName: String = "Downloaded Certificate") {
-        try {
-            val uri = Uri.fromFile(certFile)
-            setStatus("Đang xử lý chứng chỉ từ $sourceName...")
-            logActivity("Xử lý file chứng chỉ tải xuống từ $sourceName")
-            processAndCopy(uri, null)
-        } catch (e: Exception) {
-            setStatus("Lỗi khi xử lý chứng chỉ từ $sourceName: ${e.message}")
-            logActivity("Lỗi xử lý file tải xuống: ${e.message}")
-            setButtonsEnabled(true)
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("Không thể tải chứng chỉ từ Burp Suite. Kiểm tra:\n" +
+                        "1. Burp Suite đang chạy\n" +
+                        "2. IP và Port đúng\n" +
+                        "3. Proxy listener đã bật\n" +
+                        "Mã lỗi: ${response.code}")
+            }
+            response.body?.bytes() ?: throw IOException("Phản hồi rỗng từ Burp Suite")
         }
     }
 
@@ -833,7 +851,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showCertOptionsDialog(certName: String, onInstall: () -> Unit, onDelete: () -> Unit) {
-        val actualName = certName.substringBefore(" [")
+        // Hậu tố " [md5]" được thêm ở listSavedNames; cắt từ cuối để tên chứa " [" vẫn đúng
+        val actualName = certName.substringBeforeLast(" [")
         AlertDialog.Builder(this)
             .setTitle("Chọn thao tác cho: $actualName")
             .setItems(arrayOf("Cài đặt chứng chỉ", "Xóa chứng chỉ")) { _, which ->
@@ -877,39 +896,36 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun installFromSaved(name: String) {
-        try {
-            val f = File(savedDir(), "$name.pem")
-            if (!f.exists()) {
-                Toast.makeText(this, "Không tìm thấy: $name", Toast.LENGTH_SHORT).show()
-                logActivity("Không tìm thấy chứng chỉ đã lưu: $name")
-                return
-            }
+        val f = File(savedDir(), "$name.pem")
+        if (!f.exists()) {
+            Toast.makeText(this, "Không tìm thấy: $name", Toast.LENGTH_SHORT).show()
+            logActivity("Không tìm thấy chứng chỉ đã lưu: $name")
+            return
+        }
 
-            setButtonsEnabled(false)
-            logActivity("Bắt đầu cài chứng chỉ đã lưu: $name")
+        setButtonsEnabled(false)
+        logActivity("Bắt đầu cài chứng chỉ đã lưu: $name")
 
-            if (!ensureRootAccess()) {
+        lifecycleScope.launch {
+            try {
+                val hash = getSubjectHash(withContext(Dispatchers.IO) { x509FromPemFile(f) })
+
+                val installed = withContext(Dispatchers.IO) {
+                    ensureRootAccess() && installCertificateAsKernelSuModule(f, hash)
+                }
+                if (!installed) {
+                    setButtonsEnabled(true)
+                    return@launch
+                }
+
+                setStatus("Đã cài module chứng chỉ: $name. Đang tiến hành hot inject...")
+                applyCertWithoutReboot(f, hash)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                setStatus("Lỗi khi cài từ chứng chỉ đã lưu: ${e.message}")
                 setButtonsEnabled(true)
-                return
             }
-
-            val cert = x509FromPemFile(f)
-            val hash = getSubjectHash(cert)
-
-            if (!installCertificateAsKernelSuModule(f, hash)) {
-                setButtonsEnabled(true)
-                return
-            }
-
-            setStatus("Đã cài module chứng chỉ: $name. Đang tiến hành hot inject...")
-            logActivity("Cài từ chứng chỉ đã lưu thành công: $name, tiến hành inject")
-            
-            // Gọi hàm Hot-Inject
-            applyCertWithoutReboot(f, hash)
-        } catch (e: Exception) {
-            setStatus("Lỗi khi cài từ chứng chỉ đã lưu: ${e.message}")
-            logActivity("Lỗi khi cài chứng chỉ đã lưu: ${e.message}")
-            setButtonsEnabled(true)
         }
     }
 
@@ -986,10 +1002,7 @@ class MainActivity : ComponentActivity() {
         return x509FromPemBlock(pem)
     }
 
-    private fun ensurePemFromUri(uri: Uri, pkcs12Password: String?): File {
-        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: throw IllegalStateException("Không đọc được dữ liệu từ file đã chọn.")
-
+    private fun ensurePemFromBytes(bytes: ByteArray, pkcs12Password: String?): File {
         val outFile = File(cacheDir, "upload_cert.pem")
 
         if (isPem(bytes)) {
@@ -1004,7 +1017,8 @@ class MainActivity : ComponentActivity() {
                     if (chosen == null) chosen = b
                 } catch (_: Exception) {}
             }
-            outFile.writeText(chosen!! + "\n", Charsets.US_ASCII)
+            if (chosen == null) throw IllegalArgumentException("Không parse được CERTIFICATE block nào trong PEM.")
+            outFile.writeText(chosen + "\n", Charsets.US_ASCII)
             return outFile
         }
 
@@ -1034,17 +1048,20 @@ class MainActivity : ComponentActivity() {
             return outFile
         }
 
-        throw IllegalArgumentException("Định dạng không hỗ trợ hoặc cần mật khẩu PKCS#12.")
+        throw Pkcs12PasswordRequiredException()
     }
 
     private fun setStatus(msg: String) {
-        binding.tvStatus.text = msg
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            binding.tvStatus.text = msg
+        } else {
+            runOnUiThread { binding.tvStatus.text = msg }
+        }
         logActivity(msg)
     }
 
     private fun cleanupAppTempFiles() {
         File(cacheDir, "upload_cert.pem").delete()
-        File(cacheDir, "burp_cert.tmp").delete()
         File(cacheDir, "adguardcert-module.zip").delete()
     }
 
@@ -1060,7 +1077,7 @@ class MainActivity : ComponentActivity() {
     private fun writeCertificateToModule(sourcePath: String, destPath: String): Boolean {
         val result = runShellWithLog(
             "Ghi chứng chỉ vào module",
-            "mkdir -p \"$destDir\"",
+            "mkdir -p \"${File(destPath).parent}\"",
             "cp \"$sourcePath\" \"$destPath\"",
             "chmod 0644 \"$destPath\""
         )
@@ -1078,22 +1095,6 @@ class MainActivity : ComponentActivity() {
 
         logActivity("Đã ghi chứng chỉ vào module: $destPath")
         return true
-    }
-
-    private val cmdLog = mutableListOf<String>()
-
-    private fun runShell(vararg commands: String): Shell.Result {
-        val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
-        for (cmd in commands) {
-            cmdLog.add("[$time] $ $cmd")
-        }
-        val result = Shell.cmd(*commands).exec()
-        val tag = if (result.isSuccess) "OK" else "FAIL(${result.code})"
-        result.out.forEach { cmdLog.add("[$time] stdout: $it") }
-        result.err.forEach { cmdLog.add("[$time] stderr: $it") }
-        cmdLog.add("[$time] [$tag]")
-        cmdLog.add("")
-        return result
     }
 
     private fun ensureRootAccess(): Boolean {
@@ -1121,8 +1122,8 @@ class MainActivity : ComponentActivity() {
         logActivity("$step...")
 
         val result = Shell.cmd(*commands).exec()
-        val out = result.out.joinToString("\\n").trim()
-        val err = result.err.joinToString("\\n").trim()
+        val out = result.out.joinToString("\n").trim()
+        val err = result.err.joinToString("\n").trim()
 
         if (result.isSuccess) {
             logActivity("$step: OK (exit=${result.code})")
